@@ -1,27 +1,38 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
-	"reflect"
+	"os"
+	"strconv"
 	"strings"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/cognitoidentityprovider"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/seill/api/acl"
 	"github.com/seill/api/acl/authorizerFactory"
+
+	"github.com/seill/ddb"
 )
 
 var Handlers []Handler
 var ErrorCodes []ErrorCode
 
+type IService interface {
+}
+
 type Handler struct {
-	Method        string             `json:"method"`
-	Resource      string             `json:"resource"`
-	FunctionName  string             `json:"functionName"`
-	Authorization *acl.Authorization `json:"authorization"`
+	Method        string                                       `json:"method"`
+	Resource      string                                       `json:"resource"`
+	FunctionName  string                                       `json:"functionName"`
+	Function      func(IService, *Request) (*Response, *Error) `json:"-"`
+	Authorization *acl.Authorization                           `json:"authorization"`
 }
 
 type Request struct {
@@ -33,7 +44,80 @@ type Request struct {
 	Action    *acl.Action   `json:"action,omitempty"`
 }
 
-func (r *Request) Execute(httpMethod string, resource string, service interface{}) (apiResponse Response, apiError *Error) {
+func Init() (awsConfig *aws.Config, _ddb *ddb.Ddb, isLocal bool) {
+	if _value, _err := strconv.ParseBool(os.Getenv("AWS_SAM_LOCAL")); nil == _err {
+		isLocal = _value
+	}
+
+	if _value, _err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(os.Getenv("AWS_REGION"))); nil == _err {
+		awsConfig = &_value
+
+		if isLocal {
+			ddbClient := dynamodb.NewFromConfig(*awsConfig, func(o *dynamodb.Options) {
+				o.BaseEndpoint = aws.String(os.Getenv("DYNAMODB_ENDPOINT"))
+			})
+
+			_ddb = ddb.New(ddbClient, os.Getenv("DYNAMODB_TABLE"))
+		}
+	}
+
+	return
+}
+
+func Execute(tag *string, awsConfig *aws.Config, service IService, request *events.APIGatewayProxyRequest, isLocal bool) (response events.APIGatewayProxyResponse) {
+	var _apiError *Error
+	var apiRequest Request
+	var apiResponse *Response
+
+	apiRequest = Request{
+		Stage:     request.RequestContext.Stage,
+		RequestId: request.RequestContext.RequestID,
+		Payload:   _mustBuildPayload(request),
+	}
+
+	if isLocal {
+		apiRequest.Identity = &acl.Identity{
+			MemberId: aws.String("000000000000000_LOCAL_TEST"),
+			Type:     acl.IdentityTypeDummy,
+			Dummy: &acl.IdentityDummy{
+				Roles:    []string{"system/admin"},
+				Username: "local user",
+			},
+		}
+	} else {
+		var userPoolId, username, memberId string
+
+		if value, ok := request.RequestContext.Authorizer["claims"].(map[string]interface{}); ok {
+			iss := value["iss"].(string)
+			issArray := strings.Split(iss, "/")
+			userPoolId = issArray[len(issArray)-1]
+			username = value["cognito:username"].(string)
+			memberId = value["custom:memberId"].(string)
+		}
+
+		apiRequest.Identity = &acl.Identity{
+			MemberId: aws.String(memberId),
+			Type:     acl.IdentityTypeCognito,
+			Cognito: &acl.IdentityCognito{
+				CognitoIdp: cognitoidentityprovider.NewFromConfig(*awsConfig),
+				UserPoolId: userPoolId,
+				Username:   username,
+			},
+		}
+	}
+
+	apiResponse, _apiError = apiRequest._execute(request.HTTPMethod, request.Resource, service)
+	if nil != _apiError {
+		goto final
+	}
+
+final:
+	response = apiResponse._mustBuildProxyResponse(_apiError)
+
+	return
+}
+
+func (r *Request) _execute(httpMethod string, resource string, service IService) (apiResponse *Response, apiError *Error) {
 	var _err error
 
 	for _, handler := range Handlers {
@@ -56,21 +140,14 @@ func (r *Request) Execute(httpMethod string, resource string, service interface{
 				r.Action = &action
 			}
 
-			// call method by name
-			value := reflect.ValueOf(service).MethodByName(handler.FunctionName)
-			responseValues := value.Call([]reflect.Value{reflect.ValueOf(*r)})
-			if 2 == len(responseValues) {
-				if value := responseValues[0].Interface(); nil != value {
-					apiResponse = value.(Response)
-				}
-				if value := responseValues[1].Interface(); nil != value {
-					apiError = value.(*Error)
-				}
+			// call method by function
+			if nil != handler.Function {
+				apiResponse, apiError = handler.Function(service, r)
 				return
 			} else {
 				apiError = &Error{
 					ErrorCode: "99",
-					Err:       errors.New("invalid length of responseValues"),
+					Err:       errors.New("handler.Function is nil"),
 				}
 				return
 			}
@@ -97,7 +174,7 @@ type Response struct {
 	IsBaredBody      *bool             `json:"isBaredBody,omitempty"`
 }
 
-func (r *Response) MustBuildProxyResponse(apiError *Error) (response events.APIGatewayProxyResponse) {
+func (r *Response) _mustBuildProxyResponse(apiError *Error) (response events.APIGatewayProxyResponse) {
 	var locationInHeader *string
 
 	response = events.APIGatewayProxyResponse{
@@ -109,6 +186,8 @@ func (r *Response) MustBuildProxyResponse(apiError *Error) (response events.APIG
 		},
 		IsBase64Encoded: false,
 	}
+
+	r = &Response{}
 
 	// headers
 	for k, v := range r.Headers {
@@ -150,7 +229,7 @@ type ErrorCode struct {
 	StatusCode int    `json:"statusCode"`
 }
 
-func MustBuildPayload(requestProxy events.APIGatewayProxyRequest) (payload interface{}) {
+func _mustBuildPayload(requestProxy *events.APIGatewayProxyRequest) (payload interface{}) {
 	var _err error
 	payloadMap := map[string]interface{}{}
 
