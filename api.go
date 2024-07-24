@@ -211,8 +211,6 @@ func (r *Response) _mustBuildProxyResponse(apiError *Error) (response events.API
 		IsBase64Encoded: false,
 	}
 
-	r = &Response{}
-
 	// headers
 	for k, v := range r.Headers {
 		if 0 == strings.Compare(strings.ToLower(k), "location") {
