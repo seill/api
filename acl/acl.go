@@ -10,7 +10,7 @@ import (
 const IdentityTypeDummy = "Dummy"
 const IdentityTypeCognito = "Cognito"
 
-var Acls []Acl
+var Acls map[string]Acl
 
 type Identity struct {
 	MemberId *string          `json:"memberId"`
@@ -58,7 +58,6 @@ func (a *Action) GetResources() (resources []string) {
 
 type Acl struct {
 	Action
-	Role   string  `json:"role"`
 	Parent *string `json:"parent,omitempty"`
 }
 
@@ -80,23 +79,25 @@ func getActionByRoles(roles []string) (action Action) {
 		Remove: []string{},
 	}
 
-	for _, acl := range Acls {
-		for _, role := range roles {
-			if 0 == strings.Compare(acl.Role, role) {
-				action.View = append(action.View, acl.View...)
-				action.View = append(action.View, acl.Create...)
-				action.View = append(action.View, acl.Edit...)
-				action.View = append(action.View, acl.Remove...)
+	if nil == Acls {
+		return
+	}
 
-				action.Create = append(action.Create, acl.Create...)
-				action.Create = append(action.Create, acl.Edit...)
-				action.Create = append(action.Create, acl.Remove...)
+	for _, role := range roles {
+		if acl, ok := Acls[role]; ok {
+			action.View = append(action.View, acl.View...)
+			action.View = append(action.View, acl.Create...)
+			action.View = append(action.View, acl.Edit...)
+			action.View = append(action.View, acl.Remove...)
 
-				action.Edit = append(action.Edit, acl.Edit...)
-				action.Edit = append(action.Edit, acl.Remove...)
+			action.Create = append(action.Create, acl.Create...)
+			action.Create = append(action.Create, acl.Edit...)
+			action.Create = append(action.Create, acl.Remove...)
 
-				action.Remove = append(action.Remove, acl.Remove...)
-			}
+			action.Edit = append(action.Edit, acl.Edit...)
+			action.Edit = append(action.Edit, acl.Remove...)
+
+			action.Remove = append(action.Remove, acl.Remove...)
 		}
 	}
 
@@ -104,20 +105,18 @@ func getActionByRoles(roles []string) (action Action) {
 }
 
 func getParentRoles(roles []string) (parentRoles []string) {
-	for _, acl := range Acls {
-		for _, role := range roles {
-			if 0 == strings.Compare(acl.Role, role) {
-				if nil != acl.Parent {
-					if nil == parentRoles {
-						parentRoles = []string{}
-					}
+	for _, role := range roles {
+		if acl, ok := Acls[role]; ok {
+			if nil != acl.Parent {
+				if nil == parentRoles {
+					parentRoles = []string{}
+				}
 
-					parentRoles = append(parentRoles, *acl.Parent)
-					grandParentRoles := getParentRoles([]string{*acl.Parent})
+				parentRoles = append(parentRoles, *acl.Parent)
+				grandParentRoles := getParentRoles([]string{*acl.Parent})
 
-					if nil != grandParentRoles {
-						parentRoles = append(parentRoles, grandParentRoles...)
-					}
+				if nil != grandParentRoles {
+					parentRoles = append(parentRoles, grandParentRoles...)
 				}
 			}
 		}

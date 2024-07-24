@@ -17,22 +17,24 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/seill/api/acl"
 	"github.com/seill/api/acl/authorizerFactory"
+	"github.com/seill/api/menu"
 
 	"github.com/seill/ddb"
 )
 
-var Handlers []Handler
-var ErrorCodes []ErrorCode
+var Handlers map[string]map[string]Handler
+var ErrorCodes map[string]ErrorCode
 
 type IService interface {
+	OnRegisterHandlers() (handlers map[string]map[string]Handler)
+	OnRegisterErrorCodes() (errorCodes []ErrorCode)
+	OnRegisterAcls() (acls map[string]acl.Acl)
+	OnRegisterMenuItems() (items []menu.Item)
 }
 
 type Handler struct {
-	Method        string                                       `json:"method"`
-	Resource      string                                       `json:"resource"`
-	FunctionName  string                                       `json:"functionName"`
-	Function      func(IService, *Request) (*Response, *Error) `json:"-"`
-	Authorization *acl.Authorization                           `json:"authorization"`
+	Function      func(*Request) (*Response, *Error) `json:"-"`
+	Authorization *acl.Authorization                 `json:"authorization"`
 }
 
 type Request struct {
@@ -57,14 +59,30 @@ func Init() (awsConfig *aws.Config, _ddb *ddb.Ddb, isLocal bool) {
 				o.BaseEndpoint = aws.String(os.Getenv("DYNAMODB_ENDPOINT"))
 			})
 
-			_ddb = ddb.New(ddbClient, os.Getenv("DYNAMODB_TABLE"))
+			_ddb = ddb.New(ddbClient, os.Getenv("TABLE_NAME"))
 		}
 	}
 
 	return
 }
 
-func Execute(tag *string, awsConfig *aws.Config, service IService, request *events.APIGatewayProxyRequest, isLocal bool) (response events.APIGatewayProxyResponse) {
+func RegisterHandlers(handlers map[string]map[string]Handler) {
+	Handlers = handlers
+}
+
+func RegisterErrorCodes(errorCodes map[string]ErrorCode) {
+	ErrorCodes = errorCodes
+}
+
+func RegisterAcls(acls map[string]acl.Acl) {
+	acl.Acls = acls
+}
+
+func RegisterMenuItems(items []menu.Item) {
+	menu.Items = items
+}
+
+func Execute(tag *string, awsConfig *aws.Config, request *events.APIGatewayProxyRequest, isLocal bool) (response events.APIGatewayProxyResponse) {
 	var _apiError *Error
 	var apiRequest Request
 	var apiResponse *Response
@@ -106,7 +124,7 @@ func Execute(tag *string, awsConfig *aws.Config, service IService, request *even
 		}
 	}
 
-	apiResponse, _apiError = apiRequest._execute(request.HTTPMethod, request.Resource, service)
+	apiResponse, _apiError = apiRequest._execute(request.HTTPMethod, request.Resource)
 	if nil != _apiError {
 		goto final
 	}
@@ -117,40 +135,46 @@ final:
 	return
 }
 
-func (r *Request) _execute(httpMethod string, resource string, service IService) (apiResponse *Response, apiError *Error) {
+func (r *Request) _execute(httpMethod string, resource string) (apiResponse *Response, apiError *Error) {
 	var _err error
 
-	for _, handler := range Handlers {
-		if 0 == strings.Compare(httpMethod, handler.Method) && 0 == strings.Compare(resource, handler.Resource) {
-			if nil != handler.Authorization {
-				// access control
-				var roles []string
-				var action acl.Action
+	if nil == Handlers {
+		apiError = &Error{
+			ErrorCode: "99",
+			Err:       errors.New("handlers not registered"),
+		}
+		return
+	}
 
-				roles, action, _err = authorizerFactory.GetAuthorizer(r.Identity).Authorize(handler.Authorization)
-				if nil != _err {
-					apiError = &Error{
-						ErrorCode: "99",
-						Err:       _err,
-					}
-					return
-				}
+	if handler, ok := Handlers[resource][httpMethod]; ok {
+		if nil != handler.Authorization {
+			// access control
+			var roles []string
+			var action acl.Action
 
-				r.Roles = roles
-				r.Action = &action
-			}
-
-			// call method by function
-			if nil != handler.Function {
-				apiResponse, apiError = handler.Function(service, r)
-				return
-			} else {
+			roles, action, _err = authorizerFactory.GetAuthorizer(r.Identity).Authorize(handler.Authorization)
+			if nil != _err {
 				apiError = &Error{
 					ErrorCode: "99",
-					Err:       errors.New("handler.Function is nil"),
+					Err:       _err,
 				}
 				return
 			}
+
+			r.Roles = roles
+			r.Action = &action
+		}
+
+		// call method by function
+		if nil != handler.Function {
+			apiResponse, apiError = handler.Function(r)
+			return
+		} else {
+			apiError = &Error{
+				ErrorCode: "99",
+				Err:       errors.New("handler.Function is nil"),
+			}
+			return
 		}
 	}
 
@@ -224,7 +248,6 @@ func (r *Response) _mustBuildProxyResponse(apiError *Error) (response events.API
 }
 
 type ErrorCode struct {
-	Code       string `json:"error"`
 	Message    string `json:"message"`
 	StatusCode int    `json:"statusCode"`
 }
@@ -324,14 +347,19 @@ func (ae *Error) GetStatusCode() int {
 }
 
 func (ae *Error) getErrorCodes() (errorCode *ErrorCode, err error) {
-	for _, _errorCode := range ErrorCodes {
-		if 0 == strings.Compare(_errorCode.Code, ae.ErrorCode) {
-			errorCode = &_errorCode
-			return
-		}
+	if nil == ErrorCodes {
+		err = errors.New("errorCodes not registered")
+		return
 	}
 
-	return nil, errors.New("not found in errorCodes")
+	if _errorCode, ok := ErrorCodes[ae.ErrorCode]; ok {
+		errorCode = &_errorCode
+		return
+	}
+
+	err = fmt.Errorf("not found in errorCodes")
+
+	return
 }
 
 func StructToString(s interface{}) string {
