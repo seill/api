@@ -33,8 +33,8 @@ type IService interface {
 }
 
 type Handler struct {
-	Function      func(*Request) (*Response, *Error) `json:"-"`
-	Authorization *acl.Authorization                 `json:"authorization"`
+	Function      func(context.Context, *Request) (Response, *Error) `json:"-"`
+	Authorization *acl.Authorization                                 `json:"authorization"`
 }
 
 type Request struct {
@@ -46,21 +46,38 @@ type Request struct {
 	Action    *acl.Action   `json:"action,omitempty"`
 }
 
+func (r *Request) Unmarshal(v interface{}) (err error) {
+	var _bytes []byte
+
+	_bytes, err = json.Marshal(r.Payload)
+	if nil != err {
+		return
+	}
+
+	err = json.Unmarshal(_bytes, v)
+
+	return
+}
+
 func Init() (awsConfig *aws.Config, _ddb *ddb.Ddb, isLocal bool) {
 	if _value, _err := strconv.ParseBool(os.Getenv("AWS_SAM_LOCAL")); nil == _err {
 		isLocal = _value
 	}
 
 	if _value, _err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(os.Getenv("AWS_REGION"))); nil == _err {
+		var ddbClient *dynamodb.Client
+
 		awsConfig = &_value
 
 		if isLocal {
-			ddbClient := dynamodb.NewFromConfig(*awsConfig, func(o *dynamodb.Options) {
+			ddbClient = dynamodb.NewFromConfig(*awsConfig, func(o *dynamodb.Options) {
 				o.BaseEndpoint = aws.String(os.Getenv("DYNAMODB_ENDPOINT"))
 			})
-
-			_ddb = ddb.New(ddbClient, os.Getenv("TABLE_NAME"))
+		} else {
+			ddbClient = dynamodb.NewFromConfig(*awsConfig)
 		}
+
+		_ddb = ddb.New(ddbClient, os.Getenv("TABLE_NAME"))
 	}
 
 	return
@@ -82,10 +99,10 @@ func RegisterMenuItems(items []menu.Item) {
 	menu.Items = items
 }
 
-func Execute(tag *string, awsConfig *aws.Config, request *events.APIGatewayProxyRequest, isLocal bool) (response events.APIGatewayProxyResponse) {
+func Execute(ctx context.Context, tag *string, awsConfig *aws.Config, request *events.APIGatewayProxyRequest, isLocal bool) (response events.APIGatewayProxyResponse) {
 	var _apiError *Error
 	var apiRequest Request
-	var apiResponse *Response
+	var apiResponse Response
 
 	apiRequest = Request{
 		Stage:     request.RequestContext.Stage,
@@ -124,7 +141,7 @@ func Execute(tag *string, awsConfig *aws.Config, request *events.APIGatewayProxy
 		}
 	}
 
-	apiResponse, _apiError = apiRequest._execute(request.HTTPMethod, request.Resource)
+	apiResponse, _apiError = apiRequest._execute(ctx, request.HTTPMethod, request.Resource)
 	if nil != _apiError {
 		goto final
 	}
@@ -135,7 +152,7 @@ final:
 	return
 }
 
-func (r *Request) _execute(httpMethod string, resource string) (apiResponse *Response, apiError *Error) {
+func (r *Request) _execute(ctx context.Context, httpMethod string, resource string) (apiResponse Response, apiError *Error) {
 	var _err error
 
 	if nil == Handlers {
@@ -156,7 +173,7 @@ func (r *Request) _execute(httpMethod string, resource string) (apiResponse *Res
 			if nil != _err {
 				apiError = &Error{
 					ErrorCode: "99",
-					Err:       _err,
+					Err:       fmt.Errorf("not authorized"),
 				}
 				return
 			}
@@ -167,20 +184,18 @@ func (r *Request) _execute(httpMethod string, resource string) (apiResponse *Res
 
 		// call method by function
 		if nil != handler.Function {
-			apiResponse, apiError = handler.Function(r)
-			return
+			apiResponse, apiError = handler.Function(ctx, r)
 		} else {
 			apiError = &Error{
 				ErrorCode: "99",
 				Err:       errors.New("handler.Function is nil"),
 			}
-			return
 		}
-	}
-
-	apiError = &Error{
-		ErrorCode: "99",
-		Err:       errors.New("method and resource not matched"),
+	} else {
+		apiError = &Error{
+			ErrorCode: "99",
+			Err:       errors.New("method and resource not matched"),
+		}
 	}
 
 	return

@@ -12,6 +12,13 @@ const IdentityTypeCognito = "Cognito"
 
 var Acls map[string]Acl
 
+const (
+	View   = "view"
+	Create = "create"
+	Edit   = "edit"
+	Remove = "remove"
+)
+
 type Identity struct {
 	MemberId *string          `json:"memberId"`
 	Type     string           `json:"type"`
@@ -161,13 +168,13 @@ func (a *BaseAuthorizer) Authorize(authorization *Authorization, roles []string)
 	}
 
 	switch authorization.Action {
-	case "view":
+	case View:
 		authorized = foundResourceInResources(authorization.Resource, action.View)
-	case "create":
+	case Create:
 		authorized = foundResourceInResources(authorization.Resource, action.Create)
-	case "edit":
+	case Edit:
 		authorized = foundResourceInResources(authorization.Resource, action.Edit)
-	case "remove":
+	case Remove:
 		authorized = foundResourceInResources(authorization.Resource, action.Remove)
 	}
 
